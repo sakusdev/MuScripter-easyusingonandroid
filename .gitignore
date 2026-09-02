@@ -1,0 +1,16 @@
+.gradle/
+.idea/
+local.properties
+**/build/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+.DS_Store
+
+# Never commit model weights or generated ExecuTorch bundles.
+*.safetensors
+*.pte
+*.ptd
+*.bin
+models/
