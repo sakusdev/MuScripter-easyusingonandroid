@@ -1,7 +1,9 @@
 package dev.sakus.muscriptoreasy.inference
 
 import dev.sakus.muscriptoreasy.model.ModelBundle
+import org.pytorch.executorch.EValue
 import org.pytorch.executorch.Module
+import org.pytorch.executorch.Tensor
 import java.io.Closeable
 import java.io.File
 
@@ -72,6 +74,100 @@ class LocalMuScriptorEngine : Closeable {
         bundle = null
     }
 
+    /** Run conditioner.pte: [1,501,512] log-mel -> [1,503,D] prefix. */
+    fun conditionPrefix(
+        logMel: FloatArray,
+        instrumentToken: Long = 0,
+        datasetToken: Long = 0,
+    ): FloatArray {
+        val model = requireBundle()
+        require(logMel.size == MuScriptorLogMel.FRAMES * MuScriptorLogMel.MEL_BINS) {
+            "Expected ${MuScriptorLogMel.FRAMES}x${MuScriptorLogMel.MEL_BINS} log-mel values"
+        }
+
+        val melTensor = Tensor.fromBlob(
+            logMel,
+            longArrayOf(1, MuScriptorLogMel.FRAMES.toLong(), MuScriptorLogMel.MEL_BINS.toLong()),
+        )
+        val instrumentTensor = Tensor.fromBlob(
+            longArrayOf(instrumentToken),
+            longArrayOf(1, 1),
+        )
+        val datasetTensor = Tensor.fromBlob(
+            longArrayOf(datasetToken),
+            longArrayOf(1, 1),
+        )
+        val output = requireConditioner().forward(
+            EValue.from(melTensor),
+            EValue.from(instrumentTensor),
+            EValue.from(datasetTensor),
+        ).single().toTensor()
+
+        val expected = PREFIX_LENGTH * model.dim
+        require(output.numel() == expected.toLong()) {
+            "Conditioner returned ${output.numel()} values; expected $expected"
+        }
+        return output.dataAsFloatArray
+    }
+
+    /** Run embedder.pte for one upstream model token, including the initial card token. */
+    fun embedToken(token: Int): FloatArray {
+        val model = requireBundle()
+        require(token in -1..model.card) { "Token $token is outside model embedding range" }
+        val input = Tensor.fromBlob(longArrayOf(token.toLong()), longArrayOf(1, 1))
+        val output = requireEmbedder().forward(EValue.from(input)).single().toTensor()
+        require(output.numel() == model.dim.toLong()) {
+            "Embedder returned ${output.numel()} values; expected ${model.dim}"
+        }
+        return output.dataAsFloatArray
+    }
+
+    /**
+     * Run one stateful decoder position. Calling position 0 starts a logically
+     * fresh chunk because all future cache slots remain masked until overwritten.
+     */
+    fun decodeEmbedding(embedding: FloatArray, inputPos: Int): FloatArray {
+        val model = requireBundle()
+        require(embedding.size == model.dim) {
+            "Expected embedding dim ${model.dim}, got ${embedding.size}"
+        }
+        require(inputPos in 0 until model.maxContext) {
+            "Decoder position $inputPos exceeds context ${model.maxContext}"
+        }
+
+        val embeddingTensor = Tensor.fromBlob(
+            embedding,
+            longArrayOf(1, 1, model.dim.toLong()),
+        )
+        val positionTensor = Tensor.fromBlob(
+            longArrayOf(inputPos.toLong()),
+            longArrayOf(1),
+        )
+        val output = requireDecoder().forward(
+            EValue.from(embeddingTensor),
+            EValue.from(positionTensor),
+        ).single().toTensor()
+        require(output.numel() == model.card.toLong()) {
+            "Decoder returned ${output.numel()} logits; expected ${model.card}"
+        }
+        return output.dataAsFloatArray
+    }
+
+    /** Greedy MT3 selection; reserved model logits above the generated vocab are ignored. */
+    fun argmaxGenerated(logits: FloatArray): Int {
+        val limit = minOf(logits.size, Mt3Vocab.GENERATED_VOCAB_SIZE)
+        require(limit > 0) { "Empty logits" }
+        var bestToken = 0
+        var best = logits[0]
+        for (token in 1 until limit) {
+            if (logits[token] > best) {
+                best = logits[token]
+                bestToken = token
+            }
+        }
+        return bestToken
+    }
+
     fun requireConditioner(): Module =
         conditioner ?: error("No MuScriptor conditioner loaded")
 
@@ -97,5 +193,9 @@ class LocalMuScriptorEngine : Closeable {
         embedder = null
         decoder = null
         legacyModule = null
+    }
+
+    companion object {
+        const val PREFIX_LENGTH = MuScriptorLogMel.FRAMES + 2
     }
 }
