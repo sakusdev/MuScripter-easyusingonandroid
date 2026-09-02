@@ -10,7 +10,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -22,6 +21,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -55,9 +55,13 @@ private fun MuScriptorHome() {
     val store = remember { ModelStore(context.applicationContext) }
     val engine = remember { LocalMuScriptorEngine() }
 
+    DisposableEffect(engine) {
+        onDispose { engine.close() }
+    }
+
     var audioUri by remember { mutableStateOf<Uri?>(null) }
     var audioName by remember { mutableStateOf<String?>(null) }
-    var modelStatus by remember { mutableStateOf("No local model loaded") }
+    var modelStatus by remember { mutableStateOf("No local model bundle loaded") }
 
     val audioPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -72,17 +76,20 @@ private fun MuScriptorHome() {
         contract = ActivityResultContracts.OpenDocument(),
     ) { uri ->
         if (uri != null) {
-            modelStatus = "Importing model…"
+            modelStatus = "Importing model bundle…"
             scope.launch {
                 val result = withContext(Dispatchers.IO) {
                     runCatching {
-                        val file = store.importPte(uri)
-                        engine.load(file).getOrThrow()
-                        file
+                        val bundle = store.importBundle(uri)
+                        engine.load(bundle).getOrThrow()
+                        bundle
                     }
                 }
                 modelStatus = result.fold(
-                    onSuccess = { "Loaded locally: ${it.name} (${formatBytes(it.length())})" },
+                    onSuccess = {
+                        "Loaded locally: ${it.variant} / ${it.dim}d " +
+                            "(${formatBytes(it.totalBytes)}, context ${it.maxContext})"
+                    },
                     onFailure = { "Model load failed: ${it.message}" },
                 )
             }
@@ -113,10 +120,16 @@ private fun MuScriptorHome() {
 
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("Local ExecuTorch model", style = MaterialTheme.typography.titleMedium)
+                Text("Local MuScriptor model", style = MaterialTheme.typography.titleMedium)
                 Text(modelStatus)
-                Button(onClick = { modelPicker.launch(arrayOf("application/octet-stream", "*/*")) }) {
-                    Text("Import .pte model")
+                Button(
+                    onClick = {
+                        modelPicker.launch(
+                            arrayOf("application/zip", "application/octet-stream", "*/*"),
+                        )
+                    },
+                ) {
+                    Text("Import .msa bundle")
                 }
             }
         }
@@ -131,7 +144,7 @@ private fun MuScriptorHome() {
             Text("Transcribe")
         }
         Text(
-            "Runtime/model loading is wired. Next milestone: export MuScriptor with an Android-friendly KV-cache decoder ABI, then enable Transcribe.",
+            "ABI v1 model bundles are now loadable offline. Next milestone: exact Android STFT/log-mel and the greedy KV-cache generation loop.",
             style = MaterialTheme.typography.bodySmall,
         )
     }
