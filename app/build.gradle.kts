@@ -46,4 +46,6 @@ dependencies {
 
     // CPU/XNNPACK-first local runtime. Vulkan can be added as a build flavor later.
     implementation("org.pytorch:executorch-android:1.4.0")
+
+    testImplementation("junit:junit:4.13.2")
 }
