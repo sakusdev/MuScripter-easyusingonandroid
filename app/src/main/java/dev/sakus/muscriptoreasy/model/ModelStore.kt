@@ -17,12 +17,22 @@ data class ModelBundle(
     val dim: Int,
     val card: Int,
     val maxContext: Int,
+    val decoderSequenceMode: String,
+    val maxPrefillSequence: Int,
     val conditioner: File,
     val embedder: File,
     val decoder: File,
 ) {
     val totalBytes: Long
         get() = conditioner.length() + embedder.length() + decoder.length()
+
+    val supportsBlockPrefill: Boolean
+        get() = decoderSequenceMode == DECODER_MODE_DYNAMIC_BLOCK && maxPrefillSequence >= 504
+
+    companion object {
+        const val DECODER_MODE_SINGLE_STEP = "single_step"
+        const val DECODER_MODE_DYNAMIC_BLOCK = "dynamic_block_v1"
+    }
 }
 
 class ModelStore(private val context: Context) {
@@ -184,6 +194,26 @@ class ModelStore(private val context: Context) {
         val dim = model.getInt("dim")
         val card = model.getInt("card")
         val maxContext = runtime.getInt("max_context")
+        val decoderSequenceMode = runtime.optString(
+            "decoder_sequence_mode",
+            ModelBundle.DECODER_MODE_SINGLE_STEP,
+        )
+        require(
+            decoderSequenceMode == ModelBundle.DECODER_MODE_SINGLE_STEP ||
+                decoderSequenceMode == ModelBundle.DECODER_MODE_DYNAMIC_BLOCK,
+        ) {
+            "Unsupported decoder sequence mode: $decoderSequenceMode"
+        }
+        val maxPrefillSequence = runtime.optInt(
+            "max_prefill_sequence",
+            if (decoderSequenceMode == ModelBundle.DECODER_MODE_SINGLE_STEP) 1 else 0,
+        )
+        if (decoderSequenceMode == ModelBundle.DECODER_MODE_DYNAMIC_BLOCK) {
+            require(maxPrefillSequence >= 504) {
+                "Dynamic decoder must accept at least 504 prefill embeddings"
+            }
+        }
+
         require(dim > 0 && card >= 1393 && maxContext >= 504) {
             "Invalid model dimensions in manifest"
         }
@@ -195,6 +225,8 @@ class ModelStore(private val context: Context) {
             dim = dim,
             card = card,
             maxContext = maxContext,
+            decoderSequenceMode = decoderSequenceMode,
+            maxPrefillSequence = maxPrefillSequence,
             conditioner = conditioner,
             embedder = embedder,
             decoder = decoder,
