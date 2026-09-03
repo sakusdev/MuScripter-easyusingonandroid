@@ -35,6 +35,7 @@ import dev.sakus.muscriptoreasy.inference.DecodedNoteEvent
 import dev.sakus.muscriptoreasy.inference.LocalMuScriptorEngine
 import dev.sakus.muscriptoreasy.inference.LocalTranscriptionResult
 import dev.sakus.muscriptoreasy.inference.TranscriptionPipeline
+import dev.sakus.muscriptoreasy.midi.MidiExporter
 import dev.sakus.muscriptoreasy.model.ModelStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -70,7 +71,9 @@ private fun MuScriptorHome() {
     var modelStatus by remember { mutableStateOf("No local model bundle loaded") }
     var transcriptionStatus by remember { mutableStateOf("Ready when audio and model are selected") }
     var transcriptionResult by remember { mutableStateOf<LocalTranscriptionResult?>(null) }
+    var pendingMidiBytes by remember { mutableStateOf<ByteArray?>(null) }
     var isTranscribing by remember { mutableStateOf(false) }
+    var isPreparingMidi by remember { mutableStateOf(false) }
 
     val audioPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -79,6 +82,7 @@ private fun MuScriptorHome() {
             audioUri = uri
             audioName = displayName(context, uri) ?: uri.lastPathSegment ?: "Selected audio"
             transcriptionResult = null
+            pendingMidiBytes = null
             transcriptionStatus = "Audio selected"
         }
     }
@@ -104,7 +108,33 @@ private fun MuScriptorHome() {
                     onFailure = { "Model load failed: ${it.message}" },
                 )
                 transcriptionResult = null
+                pendingMidiBytes = null
             }
+        }
+    }
+
+    val midiSaver = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("audio/midi"),
+    ) { uri ->
+        val bytes = pendingMidiBytes
+        if (uri == null || bytes == null) {
+            if (uri == null) transcriptionStatus = "MIDI save cancelled"
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openOutputStream(uri, "w").use { output ->
+                        requireNotNull(output) { "Unable to open MIDI destination" }
+                        output.write(bytes)
+                        output.flush()
+                    }
+                }
+            }
+            transcriptionStatus = saved.fold(
+                onSuccess = { "MIDI saved (${formatBytes(bytes.size.toLong())})" },
+                onFailure = { "MIDI save failed: ${it.message}" },
+            )
         }
     }
 
@@ -160,6 +190,7 @@ private fun MuScriptorHome() {
                 val selected = audioUri ?: return@Button
                 isTranscribing = true
                 transcriptionResult = null
+                pendingMidiBytes = null
                 transcriptionStatus = "Starting…"
                 scope.launch {
                     val result = withContext(Dispatchers.IO) {
@@ -201,15 +232,41 @@ private fun MuScriptorHome() {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Result", style = MaterialTheme.typography.titleMedium)
                 Text(transcriptionStatus)
-                transcriptionResult?.let {
-                    Text("Audio: %.2f s".format(it.audioDurationSeconds))
-                    Text("Decoded events: ${it.events.size}")
+                transcriptionResult?.let { result ->
+                    Text("Audio: %.2f s".format(result.audioDurationSeconds))
+                    Text("Decoded events: ${result.events.size}")
+                    Button(
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !isTranscribing && !isPreparingMidi,
+                        onClick = {
+                            isPreparingMidi = true
+                            transcriptionStatus = "Preparing MIDI…"
+                            scope.launch {
+                                val encoded = withContext(Dispatchers.Default) {
+                                    runCatching { MidiExporter.encode(result.events) }
+                                }
+                                isPreparingMidi = false
+                                encoded.fold(
+                                    onSuccess = { bytes ->
+                                        pendingMidiBytes = bytes
+                                        transcriptionStatus = "MIDI ready (${formatBytes(bytes.size.toLong())})"
+                                        midiSaver.launch(suggestMidiName(audioName))
+                                    },
+                                    onFailure = {
+                                        transcriptionStatus = "MIDI export failed: ${it.message}"
+                                    },
+                                )
+                            }
+                        },
+                    ) {
+                        Text(if (isPreparingMidi) "Preparing MIDI…" else "Save MIDI")
+                    }
                 }
             }
         }
 
         Text(
-            "Local PCM decode, upstream-style sinc resampling, log-mel, KV-cache generation and MT3 event decoding are wired. MIDI export is the next output step.",
+            "Audio decode, upstream-style sinc resampling, log-mel, KV-cache generation, MT3 decoding and local type-1 MIDI export are wired end-to-end.",
             style = MaterialTheme.typography.bodySmall,
         )
     }
@@ -227,6 +284,15 @@ private fun displayName(context: Context, uri: Uri): String? {
         if (index >= 0 && cursor.moveToFirst()) return cursor.getString(index)
     }
     return null
+}
+
+private fun suggestMidiName(audioName: String?): String {
+    val base = (audioName ?: "muscriptor-transcription")
+        .substringBeforeLast('.', audioName ?: "muscriptor-transcription")
+        .replace(Regex("[^A-Za-z0-9._ -]"), "_")
+        .trim()
+        .ifEmpty { "muscriptor-transcription" }
+    return "$base.mid"
 }
 
 private fun formatBytes(bytes: Long): String {
