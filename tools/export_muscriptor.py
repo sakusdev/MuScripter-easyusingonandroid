@@ -17,6 +17,7 @@ without changing weights or MT3 decoding.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import zipfile
@@ -59,6 +60,14 @@ KNOWN_CONFIGS = {
     "large": ModelConfig("large", dim=1536, num_heads=24, num_layers=48, card=1395),
 }
 HEADS_BY_DIM = {cfg.dim: cfg.num_heads for cfg in KNOWN_CONFIGS.values()}
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def remap_legacy_keys(state: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -150,15 +159,13 @@ class Conditioner(nn.Module):
 
     def forward(
         self,
-        log_mel: torch.Tensor,           # [1, 501, 512]
-        instrument_tokens: torch.Tensor, # [1, 1]
-        dataset_tokens: torch.Tensor,    # [1, 1]
+        log_mel: torch.Tensor,
+        instrument_tokens: torch.Tensor,
+        dataset_tokens: torch.Tensor,
     ) -> torch.Tensor:
         mel = F.linear(log_mel, self.mel_weight, self.mel_bias)
         instrument = F.embedding(instrument_tokens + 1, self.instrument_weight)
         dataset = F.embedding(dataset_tokens + 1, self.dataset_weight)
-        # LMModel iterates instrument, dataset, wav and prepends each one.
-        # Repeated prepend reverses the final transformer prefix order.
         return torch.cat((mel, dataset, instrument), dim=1)
 
 
@@ -168,8 +175,6 @@ class TokenEmbedder(nn.Module):
         self.weight = nn.Parameter(_require(state, "emb.weight").clone())
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        # Android ABI normally never sends the upstream -1 zero token; retain
-        # ScaledEmbedding parity anyway so the module is independently exact.
         is_zero = token_ids < 0
         ids = torch.clamp(token_ids, min=0)
         y = F.embedding(ids, self.weight)
@@ -181,7 +186,6 @@ def sinusoidal_position(
     dim: int,
     max_period: float = 10000.0,
 ) -> torch.Tensor:
-    """Exact fp32 positional embedding used by StreamingTransformer."""
     half = dim // 2
     pos = input_pos.to(torch.float32).view(1, 1, 1)
     adim = torch.arange(
@@ -249,17 +253,15 @@ class DecoderLayer(nn.Module):
         b, s, _ = qkv.shape
         packed = qkv.view(b, s, 3, self.num_heads, self.head_dim)
         q, k, v = packed.unbind(dim=2)
-        q = q.transpose(1, 2)  # [B,H,1,D]
+        q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Static one-token decode ABI. index_copy_ mirrors ExecuTorch's Llama
-        # KVCache implementation and is captured as mutable module buffer state.
         self.k_cache.index_copy_(2, input_pos, k)
         self.v_cache.index_copy_(2, input_pos, v)
 
-        # A fixed-size cache avoids dynamic slicing. Old values above input_pos
-        # are masked, so a new chunk can restart at position 0 without clearing.
+        # Old cache slots above input_pos are invisible, so restarting at
+        # position 0 is logically equivalent to a fresh upstream model_state.
         allowed = self.cache_indices <= input_pos[0]
         mask = torch.where(
             allowed,
@@ -280,8 +282,6 @@ class DecoderLayer(nn.Module):
 
 
 class OneTokenDecoder(nn.Module):
-    """MuScriptor transformer with model-owned KV cache, one position per call."""
-
     def __init__(
         self,
         state: Mapping[str, torch.Tensor],
@@ -306,8 +306,8 @@ class OneTokenDecoder(nn.Module):
 
     def forward(
         self,
-        embedding: torch.Tensor, # [1, 1, D]
-        input_pos: torch.Tensor, # [1]
+        embedding: torch.Tensor,
+        input_pos: torch.Tensor,
     ) -> torch.Tensor:
         pos = sinusoidal_position(input_pos, self.dim).to(embedding.dtype)
         x = embedding + pos
@@ -329,7 +329,6 @@ def export_pte(
     out: Path,
     xnnpack: bool,
 ) -> None:
-    """torch.export -> Edge -> ExecuTorch .pte, optionally using XNNPACK."""
     from executorch.exir import to_edge_transform_and_lower
 
     ep = torch.export.export(model.eval(), example_inputs, strict=True)
@@ -404,10 +403,19 @@ def build_bundle(
         xnnpack,
     )
 
+    file_hashes = {
+        conditioner_path.name: sha256_file(conditioner_path),
+        embedder_path.name: sha256_file(embedder_path),
+        decoder_path.name: sha256_file(decoder_path),
+    }
     manifest = {
         "format": "muscriptor-android-bundle",
         "abi_version": ABI_VERSION,
         "model": asdict(cfg),
+        "source": {
+            "weights_name": weights.name,
+            "weights_sha256": sha256_file(weights),
+        },
         "runtime": {
             "executorch": "1.4.x",
             "backend": "xnnpack" if xnnpack else "portable",
@@ -453,6 +461,7 @@ def build_bundle(
             "embedder": embedder_path.name,
             "decoder": decoder_path.name,
         },
+        "sha256": file_hashes,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
