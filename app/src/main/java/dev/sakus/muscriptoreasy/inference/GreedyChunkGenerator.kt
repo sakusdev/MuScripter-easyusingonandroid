@@ -9,11 +9,11 @@ data class ChunkGenerationResult(
 )
 
 /**
- * Correctness-first ABI-v1 generation loop.
+ * MuScriptor greedy generation loop with automatic decoder-mode selection.
  *
- * The 503 conditioning embeddings are deliberately fed one at a time. This is
- * much slower than block prefill but gives us a static decoder shape and a very
- * simple desktop-vs-Android parity target.
+ * New dynamic bundles prefill all 503 conditioning rows plus the initial token
+ * in one ExecuTorch call. Legacy ABI-v1 bundles remain supported by falling
+ * back to the original one-row-at-a-time path.
  */
 class GreedyChunkGenerator(
     private val engine: LocalMuScriptorEngine,
@@ -47,24 +47,33 @@ class GreedyChunkGenerator(
 
         val prefix = engine.conditionPrefix(logMel)
         val dim = model.dim
-        var position = 0
-        val oneEmbedding = FloatArray(dim)
-        var lastLogits: FloatArray? = null
+        var position: Int
+        var lastLogits: FloatArray
 
-        // Prefix positions 0..502. Their logits are intentionally ignored.
-        for (prefixIndex in 0 until LocalMuScriptorEngine.PREFIX_LENGTH) {
-            prefix.copyInto(
-                oneEmbedding,
-                startIndex = prefixIndex * dim,
-                endIndex = (prefixIndex + 1) * dim,
-            )
-            lastLogits = engine.decodeEmbedding(oneEmbedding, position)
+        if (model.supportsBlockPrefill) {
+            // Prefix positions 0..502 + initial token at 503 in one forward call.
+            // Only logits for the final (initial-token) row are returned.
+            lastLogits = engine.prefillConditionsAndInitial(prefix)
+            position = LocalMuScriptorEngine.BLOCK_PREFILL_LENGTH
+        } else {
+            // Legacy ABI-v1 correctness path: feed every prefix row separately.
+            position = 0
+            val oneEmbedding = FloatArray(dim)
+            var logits: FloatArray? = null
+            for (prefixIndex in 0 until LocalMuScriptorEngine.PREFIX_LENGTH) {
+                prefix.copyInto(
+                    oneEmbedding,
+                    startIndex = prefixIndex * dim,
+                    endIndex = (prefixIndex + 1) * dim,
+                )
+                logits = engine.decodeEmbedding(oneEmbedding, position)
+                position++
+            }
+            // Upstream generation sequence always starts with initial_token_id == card.
+            logits = engine.decodeEmbedding(engine.embedToken(model.card), position)
             position++
+            lastLogits = checkNotNull(logits)
         }
-
-        // Upstream generation sequence always starts with initial_token_id == card.
-        lastLogits = engine.decodeEmbedding(engine.embedToken(model.card), position)
-        position++
 
         // For chunks after the first, upstream passes tie_section_token_ids() as
         // `prompt`. Prompt tokens are yielded downstream and teacher-forced into
@@ -80,7 +89,7 @@ class GreedyChunkGenerator(
         val freeBudget = maxGenLen - forcedPrompt.size
 
         for (step in 0 until freeBudget) {
-            val token = engine.argmaxGenerated(checkNotNull(lastLogits))
+            val token = engine.argmaxGenerated(lastLogits)
             if (token == Mt3Vocab.EOS) {
                 reachedEos = true
                 break
