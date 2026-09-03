@@ -34,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import dev.sakus.muscriptoreasy.inference.DecodedNoteEvent
 import dev.sakus.muscriptoreasy.inference.LocalMuScriptorEngine
 import dev.sakus.muscriptoreasy.inference.LocalTranscriptionResult
+import dev.sakus.muscriptoreasy.inference.Mt3Instruments
 import dev.sakus.muscriptoreasy.inference.TranscriptionPipeline
 import dev.sakus.muscriptoreasy.midi.MidiExporter
 import dev.sakus.muscriptoreasy.model.ModelStore
@@ -233,8 +234,17 @@ private fun MuScriptorHome() {
                 Text("Result", style = MaterialTheme.typography.titleMedium)
                 Text(transcriptionStatus)
                 transcriptionResult?.let { result ->
+                    val instrumentNames = Mt3Instruments.programsIn(result.events)
+                        .map(Mt3Instruments::nameForProgram)
                     Text("Audio: %.2f s".format(result.audioDurationSeconds))
                     Text("Decoded events: ${result.events.size}")
+                    Text(
+                        if (instrumentNames.isEmpty()) {
+                            "Instruments: none detected"
+                        } else {
+                            "Instruments: ${instrumentNames.joinToString()}"
+                        },
+                    )
                     Button(
                         modifier = Modifier.fillMaxWidth(),
                         enabled = !isTranscribing && !isPreparingMidi,
@@ -296,6 +306,12 @@ private fun suggestMidiName(audioName: String?): String {
 }
 
 private fun formatBytes(bytes: Long): String {
-    val mib = bytes / (1024.0 * 1024.0)
-    return if (mib >= 1024.0) "%.2f GiB".format(mib / 1024.0) else "%.1f MiB".format(mib)
+    val kib = bytes / 1024.0
+    val mib = kib / 1024.0
+    return when {
+        mib >= 1024.0 -> "%.2f GiB".format(mib / 1024.0)
+        mib >= 1.0 -> "%.1f MiB".format(mib)
+        kib >= 1.0 -> "%.1f KiB".format(kib)
+        else -> "$bytes B"
+    }
 }
