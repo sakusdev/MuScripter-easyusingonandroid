@@ -34,3 +34,8 @@ jobs:
         env:
           PYTHONPATH: tools
         run: python tools/test_exporter_runtime.py
+
+      - name: Export and execute dynamic prefill decoder
+        env:
+          PYTHONPATH: tools
+        run: python tools/test_dynamic_prefill_runtime.py
