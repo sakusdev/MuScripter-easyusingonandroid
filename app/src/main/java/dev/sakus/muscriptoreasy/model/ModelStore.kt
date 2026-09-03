@@ -51,26 +51,36 @@ class ModelStore(private val context: Context) {
 
         try {
             extractBundle(uri, temp)
-            validateBundle(temp, displayName)
+            // Hash every module exactly once while the bundle is still isolated.
+            validateBundle(temp, displayName, verifyIntegrity = true)
 
             val target = File(modelDir, safeStem)
             if (target.exists()) require(target.deleteRecursively()) {
                 "Unable to replace existing model bundle"
             }
             require(temp.renameTo(target)) { "Unable to finalize imported model bundle" }
-            return validateBundle(target, displayName)
+            target.setLastModified(System.currentTimeMillis())
+            // Private-storage rename cannot alter bytes; avoid hashing hundreds of MB twice.
+            return validateBundle(target, displayName, verifyIntegrity = false)
         } catch (t: Throwable) {
             temp.deleteRecursively()
             throw t
         }
     }
 
+    /** Installed bundles, newest import first. Integrity was checked at import time. */
     fun installedBundles(): List<ModelBundle> =
         modelDir.listFiles()
             ?.filter { it.isDirectory && !it.name.startsWith(".import-") }
-            ?.mapNotNull { runCatching { validateBundle(it, it.name + ".msa") }.getOrNull() }
-            ?.sortedBy { it.sourceName.lowercase() }
+            ?.sortedByDescending { it.lastModified() }
+            ?.mapNotNull {
+                runCatching {
+                    validateBundle(it, it.name + ".msa", verifyIntegrity = false)
+                }.getOrNull()
+            }
             .orEmpty()
+
+    fun mostRecentBundle(): ModelBundle? = installedBundles().firstOrNull()
 
     /** Kept temporarily for low-level ExecuTorch bring-up/debugging. */
     fun importPte(uri: Uri): File {
@@ -125,7 +135,11 @@ class ModelStore(private val context: Context) {
         }
     }
 
-    private fun validateBundle(dir: File, sourceName: String): ModelBundle {
+    private fun validateBundle(
+        dir: File,
+        sourceName: String,
+        verifyIntegrity: Boolean,
+    ): ModelBundle {
         require(dir.isDirectory) { "Model bundle directory does not exist" }
         val manifestFile = File(dir, "manifest.json")
         require(manifestFile.isFile) { "Bundle is missing manifest.json" }
@@ -154,9 +168,15 @@ class ModelStore(private val context: Context) {
         require(decoder.isFile && decoder.length() > 0) { "Missing decoder.pte" }
 
         val hashes = manifest.getJSONObject("sha256")
-        verifySha256(conditioner, hashes.getString(conditionerName))
-        verifySha256(embedder, hashes.getString(embedderName))
-        verifySha256(decoder, hashes.getString(decoderName))
+        // Always validate the manifest values syntactically; hash bytes only at import.
+        val conditionerHash = normalizedHash(hashes.getString(conditionerName), conditionerName)
+        val embedderHash = normalizedHash(hashes.getString(embedderName), embedderName)
+        val decoderHash = normalizedHash(hashes.getString(decoderName), decoderName)
+        if (verifyIntegrity) {
+            verifySha256(conditioner, conditionerHash)
+            verifySha256(embedder, embedderHash)
+            verifySha256(decoder, decoderHash)
+        }
 
         val model = manifest.getJSONObject("model")
         val runtime = manifest.getJSONObject("runtime")
@@ -181,11 +201,15 @@ class ModelStore(private val context: Context) {
         )
     }
 
-    private fun verifySha256(file: File, expectedRaw: String) {
-        val expected = expectedRaw.lowercase()
-        require(expected.matches(Regex("[0-9a-f]{64}"))) {
-            "Invalid SHA-256 in model manifest for ${file.name}"
+    private fun normalizedHash(raw: String, filename: String): String {
+        val hash = raw.lowercase()
+        require(hash.matches(Regex("[0-9a-f]{64}"))) {
+            "Invalid SHA-256 in model manifest for $filename"
         }
+        return hash
+    }
+
+    private fun verifySha256(file: File, expected: String) {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().buffered().use { input ->
             val buffer = ByteArray(1024 * 1024)
