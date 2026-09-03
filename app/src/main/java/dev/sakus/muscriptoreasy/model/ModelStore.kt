@@ -5,6 +5,7 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import org.json.JSONObject
 import java.io.File
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.zip.ZipInputStream
 
@@ -50,7 +51,7 @@ class ModelStore(private val context: Context) {
 
         try {
             extractBundle(uri, temp)
-            val validated = validateBundle(temp, displayName)
+            validateBundle(temp, displayName)
 
             val target = File(modelDir, safeStem)
             if (target.exists()) require(target.deleteRecursively()) {
@@ -152,6 +153,11 @@ class ModelStore(private val context: Context) {
         require(embedder.isFile && embedder.length() > 0) { "Missing embedder.pte" }
         require(decoder.isFile && decoder.length() > 0) { "Missing decoder.pte" }
 
+        val hashes = manifest.getJSONObject("sha256")
+        verifySha256(conditioner, hashes.getString(conditionerName))
+        verifySha256(embedder, hashes.getString(embedderName))
+        verifySha256(decoder, hashes.getString(decoderName))
+
         val model = manifest.getJSONObject("model")
         val runtime = manifest.getJSONObject("runtime")
         val variant = model.getString("variant")
@@ -173,6 +179,26 @@ class ModelStore(private val context: Context) {
             embedder = embedder,
             decoder = decoder,
         )
+    }
+
+    private fun verifySha256(file: File, expectedRaw: String) {
+        val expected = expectedRaw.lowercase()
+        require(expected.matches(Regex("[0-9a-f]{64}"))) {
+            "Invalid SHA-256 in model manifest for ${file.name}"
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().buffered().use { input ->
+            val buffer = ByteArray(1024 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        val actual = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        require(actual == expected) {
+            "Model bundle integrity check failed for ${file.name}"
+        }
     }
 
     private fun queryDisplayName(uri: Uri): String? {
