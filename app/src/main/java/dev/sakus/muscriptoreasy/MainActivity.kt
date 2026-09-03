@@ -24,6 +24,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -69,12 +70,35 @@ private fun MuScriptorHome() {
 
     var audioUri by remember { mutableStateOf<Uri?>(null) }
     var audioName by remember { mutableStateOf<String?>(null) }
-    var modelStatus by remember { mutableStateOf("No local model bundle loaded") }
+    var modelStatus by remember { mutableStateOf("Checking installed model…") }
     var transcriptionStatus by remember { mutableStateOf("Ready when audio and model are selected") }
     var transcriptionResult by remember { mutableStateOf<LocalTranscriptionResult?>(null) }
     var pendingMidiBytes by remember { mutableStateOf<ByteArray?>(null) }
     var isTranscribing by remember { mutableStateOf(false) }
     var isPreparingMidi by remember { mutableStateOf(false) }
+    var isModelLoading by remember { mutableStateOf(true) }
+
+    LaunchedEffect(Unit) {
+        val result = withContext(Dispatchers.IO) {
+            runCatching {
+                val bundle = store.mostRecentBundle() ?: return@runCatching null
+                engine.load(bundle).getOrThrow()
+                bundle
+            }
+        }
+        result.fold(
+            onSuccess = { bundle ->
+                modelStatus = if (bundle == null) {
+                    "No local model bundle loaded"
+                } else {
+                    "Loaded installed: ${bundle.variant} / ${bundle.dim}d " +
+                        "(${formatBytes(bundle.totalBytes)}, context ${bundle.maxContext})"
+                }
+            },
+            onFailure = { modelStatus = "Installed model load failed: ${it.message}" },
+        )
+        isModelLoading = false
+    }
 
     val audioPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -92,7 +116,8 @@ private fun MuScriptorHome() {
         contract = ActivityResultContracts.OpenDocument(),
     ) { uri ->
         if (uri != null) {
-            modelStatus = "Importing model bundle…"
+            isModelLoading = true
+            modelStatus = "Importing and verifying model bundle…"
             scope.launch {
                 val result = withContext(Dispatchers.IO) {
                     runCatching {
@@ -108,6 +133,7 @@ private fun MuScriptorHome() {
                     },
                     onFailure = { "Model load failed: ${it.message}" },
                 )
+                isModelLoading = false
                 transcriptionResult = null
                 pendingMidiBytes = null
             }
@@ -170,14 +196,14 @@ private fun MuScriptorHome() {
                 Text("Local MuScriptor model", style = MaterialTheme.typography.titleMedium)
                 Text(modelStatus)
                 Button(
-                    enabled = !isTranscribing,
+                    enabled = !isTranscribing && !isModelLoading,
                     onClick = {
                         modelPicker.launch(
                             arrayOf("application/zip", "application/octet-stream", "*/*"),
                         )
                     },
                 ) {
-                    Text("Import .msa bundle")
+                    Text(if (isModelLoading) "Loading model…" else "Import .msa bundle")
                 }
             }
         }
@@ -186,7 +212,7 @@ private fun MuScriptorHome() {
 
         Button(
             modifier = Modifier.fillMaxWidth(),
-            enabled = audioUri != null && engine.isLoaded && !isTranscribing,
+            enabled = audioUri != null && engine.isLoaded && !isTranscribing && !isModelLoading,
             onClick = {
                 val selected = audioUri ?: return@Button
                 isTranscribing = true
