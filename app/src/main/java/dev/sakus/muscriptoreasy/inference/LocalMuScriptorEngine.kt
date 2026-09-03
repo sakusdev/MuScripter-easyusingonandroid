@@ -123,26 +123,35 @@ class LocalMuScriptorEngine : Closeable {
     }
 
     /**
-     * Run one stateful decoder position. Calling position 0 starts a logically
-     * fresh chunk because all future cache slots remain masked until overwritten.
+     * Run one or more contiguous stateful decoder positions through the same
+     * `forward` method. Dynamic bundles accept up to 504 positions so the
+     * condition prefix + initial token can be prefetched in a single call.
+     * Legacy bundles still accept S=1 and are automatically kept on that path.
      */
-    fun decodeEmbedding(embedding: FloatArray, inputPos: Int): FloatArray {
+    fun decodeEmbeddings(embeddings: FloatArray, startPos: Int): FloatArray {
         val model = requireBundle()
-        require(embedding.size == model.dim) {
-            "Expected embedding dim ${model.dim}, got ${embedding.size}"
+        require(embeddings.isNotEmpty() && embeddings.size % model.dim == 0) {
+            "Decoder embedding buffer must contain complete ${model.dim}d rows"
         }
-        require(inputPos in 0 until model.maxContext) {
-            "Decoder position $inputPos exceeds context ${model.maxContext}"
+        val sequence = embeddings.size / model.dim
+        require(sequence == 1 || model.supportsBlockPrefill) {
+            "This model bundle only supports one decoder position at a time"
+        }
+        if (sequence > 1) {
+            require(sequence <= model.maxPrefillSequence) {
+                "Prefill length $sequence exceeds exported maximum ${model.maxPrefillSequence}"
+            }
+        }
+        require(startPos >= 0 && startPos + sequence <= model.maxContext) {
+            "Decoder positions $startPos..${startPos + sequence - 1} exceed context ${model.maxContext}"
         }
 
         val embeddingTensor = Tensor.fromBlob(
-            embedding,
-            longArrayOf(1, 1, model.dim.toLong()),
+            embeddings,
+            longArrayOf(1, sequence.toLong(), model.dim.toLong()),
         )
-        val positionTensor = Tensor.fromBlob(
-            longArrayOf(inputPos.toLong()),
-            longArrayOf(1),
-        )
+        val positions = LongArray(sequence) { i -> (startPos + i).toLong() }
+        val positionTensor = Tensor.fromBlob(positions, longArrayOf(sequence.toLong()))
         val output = requireDecoder().forward(
             EValue.from(embeddingTensor),
             EValue.from(positionTensor),
@@ -151,6 +160,35 @@ class LocalMuScriptorEngine : Closeable {
             "Decoder returned ${output.numel()} logits; expected ${model.card}"
         }
         return output.dataAsFloatArray
+    }
+
+    /** Run one stateful decoder position. */
+    fun decodeEmbedding(embedding: FloatArray, inputPos: Int): FloatArray {
+        val model = requireBundle()
+        require(embedding.size == model.dim) {
+            "Expected embedding dim ${model.dim}, got ${embedding.size}"
+        }
+        return decodeEmbeddings(embedding, inputPos)
+    }
+
+    /**
+     * Prefill positions 0..503 with the 503 condition rows followed by the
+     * initial model token. Returns logits for the initial token (the final row).
+     */
+    fun prefillConditionsAndInitial(prefix: FloatArray): FloatArray {
+        val model = requireBundle()
+        require(model.supportsBlockPrefill) { "Model does not support block prefill" }
+        require(prefix.size == PREFIX_LENGTH * model.dim) {
+            "Condition prefix has ${prefix.size} values; expected ${PREFIX_LENGTH * model.dim}"
+        }
+        val blockRows = PREFIX_LENGTH + 1
+        require(blockRows <= model.maxPrefillSequence)
+
+        val block = FloatArray(blockRows * model.dim)
+        prefix.copyInto(block)
+        val initial = embedToken(model.card)
+        initial.copyInto(block, destinationOffset = prefix.size)
+        return decodeEmbeddings(block, startPos = 0)
     }
 
     /** Greedy MT3 selection; reserved model logits above the generated vocab are ignored. */
@@ -197,5 +235,6 @@ class LocalMuScriptorEngine : Closeable {
 
     companion object {
         const val PREFIX_LENGTH = MuScriptorLogMel.FRAMES + 2
+        const val BLOCK_PREFILL_LENGTH = PREFIX_LENGTH + 1
     }
 }
