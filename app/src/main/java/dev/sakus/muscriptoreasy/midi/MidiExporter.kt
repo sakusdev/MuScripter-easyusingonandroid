@@ -1,6 +1,7 @@
 package dev.sakus.muscriptoreasy.midi
 
 import dev.sakus.muscriptoreasy.inference.DecodedNoteEvent
+import dev.sakus.muscriptoreasy.inference.Mt3Instruments
 import java.io.ByteArrayOutputStream
 import kotlin.math.roundToInt
 
@@ -19,7 +20,6 @@ object MidiExporter {
     const val DEFAULT_PPQ = 480
     const val DEFAULT_BPM = 120
     const val DEFAULT_VELOCITY = 100
-    private const val DRUM_PROGRAM = 128
 
     fun encode(
         events: List<DecodedNoteEvent>,
@@ -43,12 +43,14 @@ object MidiExporter {
         )
 
         val programs = linkedSetOf<Int>()
-        ordered.forEach { programs += if (isDrum(it)) DRUM_PROGRAM else programOf(it) }
+        ordered.forEach {
+            programs += if (isDrum(it)) Mt3Instruments.DRUM_PROGRAM else programOf(it)
+        }
 
         val channelByProgram = linkedMapOf<Int, Int>()
         val melodicChannels = (0..8).toMutableList().apply { addAll(10..15) }
         programs.forEach { program ->
-            channelByProgram[program] = if (program == DRUM_PROGRAM) {
+            channelByProgram[program] = if (program == Mt3Instruments.DRUM_PROGRAM) {
                 9
             } else if (melodicChannels.isNotEmpty()) {
                 melodicChannels.removeAt(0)
@@ -61,7 +63,7 @@ object MidiExporter {
         tracks += metaTrack(tempoMicros)
         for (program in programs) {
             val programEvents = ordered.filter {
-                (if (isDrum(it)) DRUM_PROGRAM else programOf(it)) == program
+                (if (isDrum(it)) Mt3Instruments.DRUM_PROGRAM else programOf(it)) == program
             }
             tracks += programTrack(
                 program = program,
@@ -109,9 +111,7 @@ object MidiExporter {
         velocity: Int,
     ): ByteArray {
         val out = ByteArrayOutputStream()
-        val name = if (program == DRUM_PROGRAM) "drums" else "program $program"
-
-        writeMetaText(out, 0x03, name)
+        writeMetaText(out, 0x03, Mt3Instruments.nameForProgram(program))
 
         // MuseScore may ignore a conductor-only tempo track, so upstream repeats
         // set_tempo on every note track too.
@@ -125,7 +125,9 @@ object MidiExporter {
 
         out.writeVlq(0)
         out.write(0xc0 or channel)
-        out.write(if (program == DRUM_PROGRAM) 0 else program.coerceIn(0, 127))
+        out.write(
+            if (program == Mt3Instruments.DRUM_PROGRAM) 0 else program.coerceIn(0, 127),
+        )
 
         var trackTick = 0
         events.forEach { event ->
