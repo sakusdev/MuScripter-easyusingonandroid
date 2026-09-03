@@ -20,9 +20,12 @@ The Android app now has the complete local control path wired:
 - exact 512-bin HTK log-mel frontend target (`501 x 512` per 5 s chunk)
 - `.msa` model-bundle importer into app-private storage
 - SHA-256 verification for every exported `.pte` module
+- automatic reuse of the most recently imported model after app restart
 - ExecuTorch Android 1.4 runtime
 - conditioner / token-embedder / stateful decoder modules
 - model-owned KV cache with chunk-local masking
+- dynamic block prefill (`503` conditions + initial token = `504` rows in one call)
+- legacy single-step decoder fallback for older bundles
 - greedy autoregressive generation
 - MT3 1393-token vocabulary decoder
 - cross-chunk tie / prelude forcing
@@ -30,6 +33,7 @@ The Android app now has the complete local control path wired:
 - pure-Kotlin type-1 MIDI writer
 - Android `Save MIDI` flow
 - unit tests for MT3, frontend/resampling reference fixtures, and MIDI bytes
+- ExecuTorch Python-runtime ABI tests for stateful KV cache and dynamic block prefill
 - GitHub Actions producing an installable debug APK artifact
 
 The remaining high-value milestone is **real-checkpoint parity on an Android device**: export the official Small/Medium weights into `.msa`, run known audio, and compare generated tokens against desktop MuScriptor.
@@ -56,12 +60,15 @@ MuScriptor/Julius-style sinc resampler
 conditioner.pte
     ↓
 503 conditioning embeddings
+    + initial model token
     ↓
-initial token + optional forced tie prelude
+one 504-row block prefill
+    ↓
+optional forced tie prelude (1 token / call)
     ↓
 decoder.pte + model-owned KV cache
     ↓
-greedy MT3 tokens
+greedy MT3 tokens (1 token / call)
     ↓
 Kotlin MT3 state machine
     ↓
@@ -106,11 +113,18 @@ python -m pip install -U pip
 python -m pip install -r tools/requirements-export.txt
 ```
 
-Then export:
+Use the optimized dynamic exporter:
 
 ```bash
-python tools/export_muscriptor.py /path/to/model.safetensors \
+PYTHONPATH=tools python tools/export_muscriptor_dynamic.py /path/to/model.safetensors \
   -o build/muscriptor-small
+```
+
+On Windows PowerShell, set `PYTHONPATH` first or run from the `tools` directory:
+
+```powershell
+$env:PYTHONPATH = "tools"
+python tools/export_muscriptor_dynamic.py C:\path\to\model.safetensors -o build\muscriptor-small
 ```
 
 If `config.json` is next to the checkpoint it is picked up automatically. Otherwise the official Small/Medium/Large architecture is inferred from the tensors where possible.
@@ -129,13 +143,15 @@ build/
 
 Import the single `.msa` file from the Android app. The bundle manifest records the source-weight SHA-256 plus SHA-256 hashes for all three `.pte` files, and the app verifies the module hashes before loading them.
 
-For a correctness-first fallback, pass `--portable` to skip XNNPACK partitioning:
+For a correctness-first backend fallback, pass `--portable` to skip XNNPACK partitioning:
 
 ```bash
-python tools/export_muscriptor.py model.safetensors \
+PYTHONPATH=tools python tools/export_muscriptor_dynamic.py model.safetensors \
   -o build/muscriptor-small-portable \
   --portable
 ```
+
+`tools/export_muscriptor.py` remains the original single-step ABI exporter. The Android app can still load its bundles, but they feed the 503-row condition prefix one position at a time and are intended mainly as a compatibility/parity fallback.
 
 ## `.msa` bundle ABI v1
 
@@ -150,7 +166,20 @@ decoder.pte
 
 The app rejects extra paths, duplicate entries, missing files, invalid ABI metadata, oversized extraction, and SHA-256 mismatches before any ExecuTorch module is mmap-loaded.
 
-The decoder ABI accepts exactly one embedding and one absolute position per call. Position `0` starts a logically fresh chunk: cache slots above the current position are masked, so stale data from a previous 5-second chunk cannot be attended to.
+Optimized bundles set:
+
+```json
+{
+  "decoder_sequence_mode": "dynamic_block_v1",
+  "max_prefill_sequence": 504
+}
+```
+
+in the manifest's `runtime` object. Their decoder uses **one stateful `forward` method** with a dynamic sequence dimension. This is deliberate: the ExecuTorch Android 1.4 `Module` wrapper does not opt into cross-method shared memory arenas, so a single method is the safest way to guarantee the same model-owned KV buffers are used by block prefill and subsequent one-token decoding.
+
+Position `0` starts a logically fresh chunk. Cache slots above each query's absolute position are masked, so stale bytes left by a previous 5-second chunk cannot be attended to.
+
+Older manifests without `decoder_sequence_mode` are interpreted as `single_step` and continue to work.
 
 ## MIDI output
 
@@ -173,9 +202,10 @@ The most useful next regression test is a known desktop MuScriptor token stream.
 
 1. Kotlin log-mel vs PyTorch log-mel.
 2. conditioning prefix output.
-3. greedy token IDs, including EOS.
-4. cross-chunk forced tie prelude.
-5. decoded note events / final MIDI.
+3. block-prefill final logits vs upstream first-step logits.
+4. greedy token IDs, including EOS.
+5. cross-chunk forced tie prelude.
+6. decoded note events / final MIDI.
 
 A previously measured reference is the Ferris Wheel 85–90 s Medium chunk, which emitted 377 tokens before EOS on the desktop path.
 
@@ -186,6 +216,8 @@ Imported bundles live only in app-private storage under:
 ```text
 files/models/
 ```
+
+The newest imported bundle is loaded automatically on the next app launch. The expensive SHA-256 pass is done at import time; startup revalidates the bundle structure and mmap-loads the modules without rehashing gigabytes of model data.
 
 The APK stays small; model data remains local after import.
 
